@@ -1,0 +1,219 @@
+#!/usr/bin/perl
+# IW signal monitoring and presence detection script (c) 2017-2020 K.Korn
+
+use strict;
+use Data::Dumper;
+use Zabbix::Sender;
+use Storable;
+use Time::HiRes qw(sleep);
+
+  local $Data::Dumper::Terse = 1;
+  local $Data::Dumper::Indent = 1;
+  local $Data::Dumper::Useqq = 1;
+  local $Data::Dumper::Deparse = 1;
+  local $Data::Dumper::Quotekeys = 0;
+  local $Data::Dumper::Sortkeys = 1;
+
+# Device names/aliases file
+# Format: 
+# 3 MAC octets, baseline signal, device name.
+# Example:
+# 98DC81 -37.15 Hall Switch
+# A138F0 -72.12 Room Sensor
+# 21E5C2 0 Kitchen Switch
+my $AFILE='/etc/mqtt-zabbix/aliases';
+
+#Exp. average divider
+my $AVG = 256;
+my $AVG_LONG = 1024;
+
+
+my $keys = {
+	RX => "rx bytes",
+	TX => "tx bytes",
+	SIG => "signal",
+	CTIME => "connected time",
+	NAME => "whatever", # not used here
+	online => "whenever",
+	SREL => "whatever"
+};
+
+my $res;
+my $resp;
+my $dist = 0;
+my $dist_prev = 0;
+my $dist_sent = 0;
+my $do_dump = 0;
+
+$SIG{USR1} = sub { 
+$do_dump = 1;
+print "Dump requested\n";
+};
+
+my $Sender = Zabbix::Sender->new({
+		'server' => '192.168.0.7',
+		'port' => 10051,
+		'hostname' => 'pi3',
+		});
+
+
+ for my $mac (keys %$res) {
+	 #Save "offline" for next execution
+	$res->{$mac}->{online}=0;
+	$res->{$mac}->{SIG} = 0;
+
+
+ }
+ 
+ 
+#Read aliases
+if (-f $AFILE) {
+ my @o = `cat $AFILE`;
+ 
+ for (@o) {
+	#print;
+	chomp;
+	next if /^\s*#/;
+
+	if (/^(\S+)\s+([.0-9-]+)\s+(.*)$/) {
+		$res->{$1}->{NAME}=$3;
+		#$res->{$1}->{BASE} =$2; //Base signal no longer needed
+		#$resp->{$1}->{BASE} =$2;
+	};
+ }
+
+};
+
+# Main loop
+print "IW Monitor starting\n";
+my $first = 1;
+my $i = 0;
+while () {
+	sleep(0.7); # Throttle execution
+	$dist = 0;
+	$i++;
+	my $t_now = time();
+	for my $mac (keys %$res) {
+		$res->{$mac}->{online}=0;
+	};
+	
+	open my $oh, "-|","/usr/sbin/iw",qw(dev wlan0 station dump);
+	my $mac;
+
+	while (my $line = <$oh>) {
+		chomp $line;
+		$mac = uc($1.$2.$3) if $line =~ /Station ..:..:..:(..):(..):(..) \(/;
+		next if $res->{$mac}->{NAME} eq '';
+		for my $key (qw(RX TX SIG CTIME)) {
+
+			my $k = $keys->{$key};
+			my $v;
+			if ($line =~ /^\s+$k:\s+(\S+)/) {
+				$v = $1;
+				if (defined $resp->{$mac}->{$key}) {
+					$resp->{$mac}->{$key} = $res->{$mac}->{$key};
+				} else {
+					$resp->{$mac}->{$key} = $v;
+				}
+				if ($key eq 'SIG') {
+
+				 if (!defined $res->{$mac}->{BASE}) {
+                                        $res->{$mac}->{BASE} = $v;
+                                        $resp->{$mac}->{BASE} = $v;
+                                }
+
+				if (abs($v - $resp->{$mac}->{$key}) > 376.2 ) {
+					#printf("%s (%s) changed: %0.2f -> %0.2f (Base: %0.2f)\n",$mac ,$res->{$mac}->{NAME},$resp->{$mac}->{$key},$v,$resp->{$mac}->{BASE}); 
+					$resp->{$mac}->{$key} = $v;
+				}
+				#"current signal as an average over AVG samples.
+				$res->{$mac}->{$key} = ($v + ($AVG-1)*$resp->{$mac}->{$key})/$AVG;
+				
+				# Dynamic "baseline" calculated as an average over AVG_LONG samples
+				$res->{$mac}->{BASE} = ($v + ($AVG_LONG-1)*$resp->{$mac}->{BASE})/$AVG_LONG;
+				$resp->{$mac}->{BASE} =  $res->{$mac}->{BASE};
+				
+				#Relative signal.
+				$res->{$mac}->{SREL} = sprintf("%0.7f",$res->{$mac}->{$key} - $res->{$mac}->{BASE});
+				#print "p: ".$resp->{$mac}->{$key} ." n: ".$res->{$mac}->{$key}." r: $v d: ".$res->{$mac}->{SREL}." b: " .$res->{$mac}->{BASE}. "\n";
+				
+				# Root Mean Square of all values stored in $dist
+				$dist += $res->{$mac}->{SREL} **2;
+				
+				 if ($i < $AVG) { # If not enough samples were connected yet
+						$res->{$mac}->{BASE} = $res->{$mac}->{$key};
+						$resp->{$mac}->{BASE} = $res->{$mac}->{$key};
+				}
+
+				} else {
+					$res->{$mac}->{$key} = $v;
+				}
+			}
+		}
+			$res->{$mac}->{online}=1;
+			$res->{$mac}->{CTIME} = 600 * int($res->{$mac}->{CTIME}/600) if ($res->{$mac}->{CTIME} > 600);
+	}
+	close $oh;
+	if (($i < $AVG) and ($i % 50  == 0)) {
+		print "Waiting to settle: $i/". $AVG.", dr: $dist\n";
+		
+	}
+	$dist = sprintf("%0.3f",sqrt($dist));
+	#print "    Dist: $dist\n";
+        next if ($i < $AVG);
+
+	# Send main "dist" value to Zabbix if the value changed by >0.2 or 600 seconds passed
+	if (((abs($dist - $dist_prev) > 0.2) or ($t_now - $dist_sent > 600)) and ($t_now - $dist_sent > 5)) {
+		#print " dist changed: $dist_prev -> $dist\n";
+		$Sender->bulk_buf_add(["iwdev.dist",$dist,$t_now]);
+		$dist_prev = $dist;
+		$dist_sent = $t_now;
+	}
+	if ($do_dump eq 1) { # Debug dump
+	
+		print Dumper($res); 
+		print "Dist: $dist\n";
+		$do_dump = 0;
+	}
+	
+	# Send per-device stats
+	for my $mac (keys %$res) {
+		next if $mac eq 'ls';
+		next if (($res->{$mac}->{online} == 0) and ($res->{ls}->{$mac}->{online} == 1));
+		for my $key (sort keys %$keys) {
+			next if $key eq 'NAME';
+			next if $key eq 'BASE';
+			next if $key ne 'online' and $res->{$mac}->{NAME} eq '';
+			
+			my $SENS=0.35;
+			$SENS=0.1 if $key eq 'SREL';
+
+			my $send = 0;
+			$send = 1 if (!defined $res->{ls}->{$mac}->{$key}->{t});
+			$send = 1 if ($t_now - $res->{ls}->{$mac}->{$key}->{t} > 600); 
+			$send = 1 if (($t_now - $res->{ls}->{$mac}->{$key}->{t} > 120)  and ($key == 'online') and ($res->{$mac}->{$key} eq 0)); 
+			$send = 1 if (abs($res->{$mac}->{$key} - $res->{ls}->{$mac}->{$key}->{v}) > $SENS);
+
+			$send = 0 if (($t_now - $res->{ls}->{$mac}->{$key}->{t} < 600) and ($key =~ /[RT]X/));
+			$send = 0 if  ($t_now - $res->{ls}->{$mac}->{$key}->{t} < 3); 
+
+
+			if ($send == 1) {
+				#print "$t_now $mac (".$res->{$mac}->{NAME}.")\t$key changed: ".$res->{ls}->{$mac}->{$key}->{v}." -> ".$res->{$mac}->{$key}."\n"  if (($ARGV[0] eq '-d') or (($key eq 'online') and ($res->{$mac}->{$key} == 0)));
+				#print "iwdev.stat[".$mac.",".$key."]\n";
+				$res->{ls}->{$mac}->{$key}->{t} = $t_now;
+				$res->{ls}->{$mac}->{$key}->{v} = $res->{$mac}->{$key};
+				$Sender->bulk_buf_add(["iwdev.stat[".$mac.",".$key."]",$res->{$mac}->{$key},$t_now]) if ($res->{$mac}->{$key} ne '');
+			}
+		}
+	}
+	$Sender->bulk_send if ($ARGV[0] ne '-d');
+	
+}
+
+
+
+
+
+
+

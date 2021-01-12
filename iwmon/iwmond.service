@@ -1,0 +1,16 @@
+[Unit]
+Description=IW client monitor daemon
+After=network.target zabbix_server.service
+Requires=zabbix_server.service
+Wants=zabbix_server.service
+
+[Service]
+Type=simple
+User=zabbix
+ExecStart=/usr/local/sbin/iwmond
+Restart=on-failure
+RestartSec=30s
+
+[Install]
+WantedBy=multi-user.target
+

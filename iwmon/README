@@ -1,0 +1,2 @@
+Linux hostapd AP based ("iw dev wlan0 station dump") volumetric presence detection script.
+Wireless signal (RSSI) changes for stationary clients (IoT light switches, etc) allow us to predict if humans are moving withing the area covered by Wi-fi signal.
